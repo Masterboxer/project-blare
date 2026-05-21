@@ -8,6 +8,7 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:volume_controller/volume_controller.dart';
 import 'package:android_alarm_manager_plus/android_alarm_manager_plus.dart';
 
@@ -22,9 +23,6 @@ void startCallback() {
 
 class _KeepAliveHandler extends TaskHandler {
   final AudioPlayer _player = AudioPlayer();
-  final Battery _battery = Battery();
-
-  StreamSubscription<BatteryState>? _batterySub;
 
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
@@ -41,13 +39,6 @@ class _KeepAliveHandler extends TaskHandler {
     await _player.play();
 
     dev.log('Alarm audio started from foreground service', name: 'BLARE');
-
-    _batterySub = _battery.onBatteryStateChanged.listen((state) async {
-      if (state == BatteryState.charging || state == BatteryState.full) {
-        await _player.stop();
-        await FlutterForegroundTask.stopService();
-      }
-    });
   }
 
   @override
@@ -55,7 +46,6 @@ class _KeepAliveHandler extends TaskHandler {
 
   @override
   Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
-    await _batterySub?.cancel();
     await _player.stop();
     await _player.dispose();
 
@@ -109,6 +99,30 @@ Future<void> alarmCallback() async {
     notificationText: 'Plug in charger to silence.',
     callback: startCallback,
   );
+}
+
+const String kAlarmTimeKey = 'scheduled_alarm_time';
+
+Future<void> saveAlarm(DateTime dt) async {
+  final prefs = await SharedPreferences.getInstance();
+
+  await prefs.setString(kAlarmTimeKey, dt.toIso8601String());
+}
+
+Future<DateTime?> loadAlarm() async {
+  final prefs = await SharedPreferences.getInstance();
+
+  final raw = prefs.getString(kAlarmTimeKey);
+
+  if (raw == null) return null;
+
+  return DateTime.tryParse(raw);
+}
+
+Future<void> clearAlarm() async {
+  final prefs = await SharedPreferences.getInstance();
+
+  await prefs.remove(kAlarmTimeKey);
 }
 
 void main() async {
@@ -186,6 +200,8 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
   void initState() {
     super.initState();
 
+    _restoreAlarm();
+
     _ringController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 900),
@@ -196,12 +212,72 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
     );
 
     _loadBattery();
+    _batterySub = _battery.onBatteryStateChanged.listen((state) async {
+      if (!mounted) return;
+
+      setState(() {
+        _batteryState = state;
+      });
+
+      if (state == BatteryState.charging || state == BatteryState.full) {
+        final running = await FlutterForegroundTask.isRunningService;
+
+        if (running) {
+          dev.log('UI detected charger — stopping service', name: 'BLARE');
+
+          await FlutterForegroundTask.stopService();
+
+          setState(() {
+            _alarmTriggered = false;
+          });
+
+          _showSnack('Charger connected — alarm silenced.', isAuto: true);
+        }
+      }
+    });
     Timer.periodic(const Duration(seconds: 20), (_) => _loadBattery());
 
     VolumeController.instance.showSystemUI = false;
     VolumeController.instance.addListener((vol) {
       if (mounted) setState(() => _volume = vol);
     }, fetchInitialVolume: true);
+
+    FlutterForegroundTask.isRunningService.then((running) {
+      if (mounted && running) {
+        setState(() {
+          _alarmTriggered = true;
+        });
+
+        _ringController.repeat();
+        _glowController.repeat(reverse: true);
+      }
+    });
+  }
+
+  Future<void> _restoreAlarm() async {
+    final saved = await loadAlarm();
+
+    if (!mounted || saved == null) return;
+
+    if (saved.isAfter(DateTime.now())) {
+      setState(() {
+        _scheduledAlarm = saved;
+      });
+    } else {
+      await clearAlarm();
+    }
+
+    final running = await FlutterForegroundTask.isRunningService;
+
+    if (running && mounted) {
+      setState(() {
+        _alarmTriggered = true;
+      });
+
+      _ringController.repeat();
+
+      _glowController.repeat(reverse: true);
+    }
   }
 
   Future<void> _loadBattery() async {
@@ -272,6 +348,8 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
     setState(() {
       _scheduledAlarm = alarmTime;
     });
+
+    await saveAlarm(alarmTime);
 
     final canSchedule = await AndroidAlarmManager.periodic(
       const Duration(hours: 1),
