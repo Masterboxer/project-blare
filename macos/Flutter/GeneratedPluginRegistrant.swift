@@ -5,14 +5,16 @@
 import FlutterMacOS
 import Foundation
 
-import audioplayers_darwin
+import audio_session
 import battery_plus
+import just_audio
 import shared_preferences_foundation
 import volume_controller
 
 func RegisterGeneratedPlugins(registry: FlutterPluginRegistry) {
-  AudioplayersDarwinPlugin.register(with: registry.registrar(forPlugin: "AudioplayersDarwinPlugin"))
+  AudioSessionPlugin.register(with: registry.registrar(forPlugin: "AudioSessionPlugin"))
   BatteryPlusMacosPlugin.register(with: registry.registrar(forPlugin: "BatteryPlusMacosPlugin"))
+  JustAudioPlugin.register(with: registry.registrar(forPlugin: "JustAudioPlugin"))
   SharedPreferencesPlugin.register(with: registry.registrar(forPlugin: "SharedPreferencesPlugin"))
   VolumeControllerPlugin.register(with: registry.registrar(forPlugin: "VolumeControllerPlugin"))
 }

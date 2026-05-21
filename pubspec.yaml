@@ -9,7 +9,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  audioplayers: ^6.6.0
+  just_audio: ^0.10.5
   battery_plus: ^7.0.0
   volume_controller: ^3.5.0
   flutter_foreground_task: ^9.2.2

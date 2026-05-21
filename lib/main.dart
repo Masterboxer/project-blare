@@ -1,16 +1,17 @@
 import 'dart:async';
 import 'dart:developer' as dev;
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:audioplayers/audioplayers.dart';
 import 'package:battery_plus/battery_plus.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:volume_controller/volume_controller.dart';
 
-// ── Foreground service: just keeps the process alive, does NOT play audio ────
-// Audio lives in the main isolate where AssetSource works reliably.
-
 const String kPortName = 'blare_port';
+
+String? globalAlarmPath;
 
 @pragma('vm:entry-point')
 void startCallback() {
@@ -18,9 +19,33 @@ void startCallback() {
 }
 
 class _KeepAliveHandler extends TaskHandler {
+  final AudioPlayer _player = AudioPlayer();
+  final Battery _battery = Battery();
+
+  StreamSubscription<BatteryState>? _batterySub;
+
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
-    dev.log('KeepAlive service started', name: 'BLARE');
+    dev.log('Foreground service started', name: 'BLARE');
+
+    final path = await copyAlarmToFile();
+
+    await _player.setFilePath(path);
+
+    await _player.setLoopMode(LoopMode.one);
+
+    await _player.setVolume(1.0);
+
+    await _player.play();
+
+    dev.log('Alarm audio started from foreground service', name: 'BLARE');
+
+    _batterySub = _battery.onBatteryStateChanged.listen((state) async {
+      if (state == BatteryState.charging || state == BatteryState.full) {
+        await _player.stop();
+        await FlutterForegroundTask.stopService();
+      }
+    });
   }
 
   @override
@@ -28,13 +53,39 @@ class _KeepAliveHandler extends TaskHandler {
 
   @override
   Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
-    dev.log('KeepAlive service destroyed', name: 'BLARE');
+    await _batterySub?.cancel();
+    await _player.stop();
+    await _player.dispose();
+
+    dev.log('Foreground service destroyed', name: 'BLARE');
   }
 }
 
-// ── App ───────────────────────────────────────────────────────────────────────
-void main() {
+Future<String> copyAlarmToFile() async {
+  final dir = await getApplicationDocumentsDirectory();
+
+  final file = File('${dir.path}/alarm.mp3');
+
+  if (await file.exists()) {
+    return file.path;
+  }
+
+  final data = await rootBundle.load('assets/alarm.mp3');
+
+  final bytes = data.buffer.asUint8List();
+
+  await file.writeAsBytes(bytes);
+
+  return file.path;
+}
+
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  await FlutterForegroundTask.requestNotificationPermission();
+
+  globalAlarmPath = await copyAlarmToFile();
+
   FlutterForegroundTask.init(
     androidNotificationOptions: AndroidNotificationOptions(
       channelId: 'blare_alarm',
@@ -52,6 +103,7 @@ void main() {
       autoRunOnBoot: false,
     ),
   );
+
   runApp(const BlareApp());
 }
 
@@ -71,7 +123,6 @@ class BlareApp extends StatelessWidget {
   }
 }
 
-// ── Main Page ─────────────────────────────────────────────────────────────────
 class AlarmPage extends StatefulWidget {
   const AlarmPage({super.key});
   @override
@@ -79,8 +130,6 @@ class AlarmPage extends StatefulWidget {
 }
 
 class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
-  // Audio lives here in the main isolate — same as the original that worked
-  final AudioPlayer _player = AudioPlayer();
   final Battery _battery = Battery();
   StreamSubscription<BatteryState>? _batterySub;
 
@@ -118,7 +167,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
     _loadBattery();
     Timer.periodic(const Duration(seconds: 20), (_) => _loadBattery());
 
-    // Sync slider to current system media volume
     VolumeController.instance.showSystemUI = false;
     VolumeController.instance.addListener((vol) {
       if (mounted) setState(() => _volume = vol);
@@ -128,21 +176,20 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
   Future<void> _loadBattery() async {
     final level = await _battery.batteryLevel;
     final state = await _battery.batteryState;
-    if (mounted)
+    if (mounted) {
       setState(() {
         _batteryLevel = level;
         _batteryState = state;
       });
+    }
   }
 
-  // ── ARM ───────────────────────────────────────────────────────────────────
   Future<void> _start() async {
     setState(() => _isRunning = true);
     _ringController.repeat();
     _glowController.repeat(reverse: true);
     HapticFeedback.heavyImpact();
 
-    // 1. Start foreground service — keeps process alive when app is closed
     await FlutterForegroundTask.requestIgnoreBatteryOptimization();
     await FlutterForegroundTask.startService(
       serviceId: 1001,
@@ -151,24 +198,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
       callback: startCallback,
     );
 
-    // 2. Play audio in main isolate (AssetSource works here, always has)
-    await _player.setAudioContext(
-      AudioContext(
-        android: AudioContextAndroid(
-          audioFocus: AndroidAudioFocus.gain,
-          stayAwake: true,
-          contentType: AndroidContentType.music,
-          usageType: AndroidUsageType.alarm,
-          isSpeakerphoneOn: false,
-        ),
-      ),
-    );
-    await _player.setReleaseMode(ReleaseMode.loop);
-    await _player.setVolume(1.0);
-    await _player.play(AssetSource('alarm.mp3'));
-    dev.log('Audio playing via AssetSource', name: 'BLARE');
-
-    // 3. Watch battery state
     _batterySub = _battery.onBatteryStateChanged.listen((state) {
       if (mounted) setState(() => _batteryState = state);
       if (state == BatteryState.charging || state == BatteryState.full) {
@@ -177,7 +206,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
     });
   }
 
-  // ── DISARM ────────────────────────────────────────────────────────────────
   Future<void> _stopAlarm({bool auto = false}) async {
     if (!_isRunning) return;
     setState(() => _isRunning = false);
@@ -187,7 +215,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
     _glowController.reset();
     HapticFeedback.mediumImpact();
 
-    await _player.stop();
     await _batterySub?.cancel();
     _batterySub = null;
     await FlutterForegroundTask.stopService();
@@ -198,7 +225,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
     );
   }
 
-  // ── VOLUME ────────────────────────────────────────────────────────────────
   void _onVolumeChange(double v) {
     setState(() => _volume = v);
     VolumeController.instance.setVolume(v);
@@ -241,7 +267,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
 
   @override
   void dispose() {
-    _player.dispose();
     _batterySub?.cancel();
     _ringController.dispose();
     _glowController.dispose();
@@ -249,7 +274,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
     super.dispose();
   }
 
-  // ── BUILD ─────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     final isCharging =
@@ -261,7 +285,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
       body: SafeArea(
         child: Column(
           children: [
-            // Top bar
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
               child: Row(
@@ -298,7 +321,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
 
             const SizedBox(height: 12),
 
-            // Central button
             Expanded(
               child: Center(
                 child: GestureDetector(
@@ -409,7 +431,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
               ),
             ),
 
-            // Status
             Padding(
               padding: const EdgeInsets.only(bottom: 12),
               child: AnimatedSwitcher(
@@ -436,7 +457,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
               ),
             ),
 
-            // Bottom panel
             Container(
               margin: const EdgeInsets.fromLTRB(16, 0, 16, 20),
               padding: const EdgeInsets.all(20),
@@ -447,7 +467,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
               ),
               child: Column(
                 children: [
-                  // Volume slider
                   Row(
                     children: [
                       Icon(
@@ -498,7 +517,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
                     ],
                   ),
                   const SizedBox(height: 16),
-                  // Stats
                   Row(
                     children: [
                       _Stat(
@@ -541,7 +559,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
   );
 }
 
-// ── Painters & sub-widgets ────────────────────────────────────────────────────
 class _DashedRingPainter extends CustomPainter {
   final Color color;
   const _DashedRingPainter({required this.color});

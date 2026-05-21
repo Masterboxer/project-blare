@@ -29,9 +29,8 @@
             </intent-filter>
         </activity>
 
-        <!-- THIS WAS MISSING — without it Android refuses to start the service -->
         <service
-            android:name="com.pravera.flutter_foreground_task.service.ForegroundTaskService"
+            android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
             android:foregroundServiceType="mediaPlayback"
             android:exported="false" />
 
