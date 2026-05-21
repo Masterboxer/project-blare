@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:developer' as dev;
 import 'dart:io';
+import 'dart:ui';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:battery_plus/battery_plus.dart';
@@ -12,9 +14,46 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:volume_controller/volume_controller.dart';
 import 'package:android_alarm_manager_plus/android_alarm_manager_plus.dart';
 
-const String kPortName = 'blare_port';
+const String kAlarmTimeKey = 'scheduled_alarm_time';
+const String kAlarmPathKey = 'alarm_file_path';
 
-String? globalAlarmPath;
+Future<String> copyAlarmToFile() async {
+  final dir = await getApplicationDocumentsDirectory();
+  final file = File('${dir.path}/alarm.mp3');
+  if (!await file.exists()) {
+    final data = await rootBundle.load('assets/alarm.mp3');
+    await file.writeAsBytes(data.buffer.asUint8List());
+    dev.log('alarm.mp3 written to ${file.path}', name: 'BLARE');
+  }
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(kAlarmPathKey, file.path);
+  return file.path;
+}
+
+Future<String?> getAlarmFilePath() async {
+  final prefs = await SharedPreferences.getInstance();
+  final path = prefs.getString(kAlarmPathKey);
+  if (path == null) return null;
+  final exists = await File(path).exists();
+  return exists ? path : null;
+}
+
+Future<void> saveAlarm(DateTime dt) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(kAlarmTimeKey, dt.toIso8601String());
+}
+
+Future<DateTime?> loadAlarm() async {
+  final prefs = await SharedPreferences.getInstance();
+  final raw = prefs.getString(kAlarmTimeKey);
+  if (raw == null) return null;
+  return DateTime.tryParse(raw);
+}
+
+Future<void> clearAlarm() async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.remove(kAlarmTimeKey);
+}
 
 @pragma('vm:entry-point')
 void startCallback() {
@@ -22,67 +61,98 @@ void startCallback() {
 }
 
 class _KeepAliveHandler extends TaskHandler {
-  final AudioPlayer _player = AudioPlayer();
+  AudioPlayer? _player;
+  bool _stopping = false;
 
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
-    dev.log('Foreground service started', name: 'BLARE');
+    dev.log('Service onStart', name: 'BLARE');
+    _stopping = false;
 
-    final path = await copyAlarmToFile();
+    final path = await getAlarmFilePath();
+    if (path == null) {
+      dev.log('No alarm file path found — aborting', name: 'BLARE');
+      return;
+    }
 
-    await _player.setFilePath(path);
-
-    await _player.setLoopMode(LoopMode.one);
-
-    await _player.setVolume(1.0);
-
-    await _player.play();
+    try {
+      _player = AudioPlayer();
+      await _player!.setFilePath(path);
+      await _player!.setLoopMode(LoopMode.one);
+      await _player!.setVolume(1.0);
+      await _player!.play();
+      dev.log('Audio playing: $path', name: 'BLARE');
+    } catch (e) {
+      dev.log('Audio error: $e', name: 'BLARE');
+    }
   }
 
   @override
-  void onRepeatEvent(DateTime timestamp) {}
+  void onRepeatEvent(DateTime timestamp) {
+    _checkCharger();
+  }
+
+  Future<void> _checkCharger() async {
+    if (_stopping) return;
+    try {
+      await Battery().batteryLevel;
+      final state = await Battery().batteryState;
+      dev.log('Charger poll: $state', name: 'BLARE');
+      if (state == BatteryState.charging || state == BatteryState.full) {
+        await _doStop();
+      }
+    } catch (e) {
+      dev.log('Charger poll error: $e', name: 'BLARE');
+    }
+  }
+
+  Future<void> _doStop() async {
+    if (_stopping) return;
+    _stopping = true;
+    dev.log('_doStop called', name: 'BLARE');
+    try {
+      await _player?.stop();
+      await _player?.dispose();
+      _player = null;
+      await clearAlarm();
+    } catch (e) {
+      dev.log('_doStop error: $e', name: 'BLARE');
+    }
+    Future.delayed(Duration.zero, () async {
+      await FlutterForegroundTask.stopService();
+    });
+  }
 
   @override
   Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
-    await _player.stop();
-    await _player.dispose();
-
-    dev.log('Foreground service destroyed', name: 'BLARE');
+    dev.log('Service onDestroy', name: 'BLARE');
+    try {
+      await _player?.stop();
+      await _player?.dispose();
+      _player = null;
+    } catch (_) {}
   }
 
   @override
   Future<void> onReceiveData(Object data) async {
+    dev.log('Service received: $data', name: 'BLARE');
     if (data == 'STOP_ALARM') {
-      await clearAlarm();
-
-      await _player.stop();
-
-      await FlutterForegroundTask.stopService();
+      await _doStop();
     }
   }
-}
-
-Future<String> copyAlarmToFile() async {
-  final dir = await getApplicationDocumentsDirectory();
-
-  final file = File('${dir.path}/alarm.mp3');
-
-  if (await file.exists()) {
-    return file.path;
-  }
-
-  final data = await rootBundle.load('assets/alarm.mp3');
-
-  final bytes = data.buffer.asUint8List();
-
-  await file.writeAsBytes(bytes);
-
-  return file.path;
 }
 
 @pragma('vm:entry-point')
 Future<void> alarmCallback() async {
   WidgetsFlutterBinding.ensureInitialized();
+  DartPluginRegistrant.ensureInitialized();
+  dev.log('alarmCallback fired', name: 'BLARE');
+
+  final path = await getAlarmFilePath();
+  if (path == null) {
+    dev.log('alarmCallback: alarm file missing, aborting', name: 'BLARE');
+    return;
+  }
 
   FlutterForegroundTask.init(
     androidNotificationOptions: AndroidNotificationOptions(
@@ -97,49 +167,24 @@ Future<void> alarmCallback() async {
       playSound: false,
     ),
     foregroundTaskOptions: ForegroundTaskOptions(
-      eventAction: ForegroundTaskEventAction.nothing(),
+      eventAction: ForegroundTaskEventAction.repeat(1000),
       autoRunOnBoot: false,
     ),
   );
 
   await FlutterForegroundTask.startService(
     serviceId: 1001,
-    notificationTitle: '🔔 Blare Alarm Ringing',
-    notificationText: 'Plug in charger to silence.',
+    notificationTitle: 'Project Blare Alarm Ringing',
+    notificationText:
+        'Plug in your charger and open the app to silence this alarm',
     callback: startCallback,
   );
 }
 
-const String kAlarmTimeKey = 'scheduled_alarm_time';
-
-Future<void> saveAlarm(DateTime dt) async {
-  final prefs = await SharedPreferences.getInstance();
-
-  await prefs.setString(kAlarmTimeKey, dt.toIso8601String());
-}
-
-Future<DateTime?> loadAlarm() async {
-  final prefs = await SharedPreferences.getInstance();
-
-  final raw = prefs.getString(kAlarmTimeKey);
-
-  if (raw == null) return null;
-
-  return DateTime.tryParse(raw);
-}
-
-Future<void> clearAlarm() async {
-  final prefs = await SharedPreferences.getInstance();
-
-  await prefs.remove(kAlarmTimeKey);
-}
-
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
   await FlutterForegroundTask.requestNotificationPermission();
-
-  globalAlarmPath = await copyAlarmToFile();
+  await copyAlarmToFile();
 
   FlutterForegroundTask.init(
     androidNotificationOptions: AndroidNotificationOptions(
@@ -154,20 +199,19 @@ void main() async {
       playSound: false,
     ),
     foregroundTaskOptions: ForegroundTaskOptions(
-      eventAction: ForegroundTaskEventAction.nothing(),
+      eventAction: ForegroundTaskEventAction.repeat(1000),
       autoRunOnBoot: false,
     ),
   );
 
   await AndroidAlarmManager.initialize();
-
   FlutterForegroundTask.initCommunicationPort();
-
   runApp(const BlareApp());
 }
 
 class BlareApp extends StatelessWidget {
   const BlareApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -184,6 +228,7 @@ class BlareApp extends StatelessWidget {
 
 class AlarmPage extends StatefulWidget {
   const AlarmPage({super.key});
+
   @override
   State<AlarmPage> createState() => _AlarmPageState();
 }
@@ -191,6 +236,7 @@ class AlarmPage extends StatefulWidget {
 class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
   final Battery _battery = Battery();
   StreamSubscription<BatteryState>? _batterySub;
+  Timer? _watchdog;
 
   DateTime? _scheduledAlarm;
   bool _alarmTriggered = false;
@@ -211,8 +257,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
   void initState() {
     super.initState();
 
-    _restoreAlarm();
-
     _ringController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 900),
@@ -222,78 +266,114 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
       duration: const Duration(milliseconds: 1200),
     );
 
+    _restoreAlarm();
     _loadBattery();
+
+    // Stops alarm immediately when charger is plugged while app is open
     _batterySub = _battery.onBatteryStateChanged.listen((state) async {
       if (!mounted) return;
-
-      setState(() {
-        _batteryState = state;
-      });
-
-      if (state == BatteryState.charging || state == BatteryState.full) {
-        final running = await FlutterForegroundTask.isRunningService;
-
-        if (running) {
-          FlutterForegroundTask.sendDataToTask('STOP_ALARM');
-
-          setState(() {
-            _alarmTriggered = false;
-            _scheduledAlarm = null;
-          });
-
-          _ringController.stop();
-          _ringController.reset();
-
-          _glowController.stop();
-          _glowController.reset();
-
-          await clearAlarm();
-
-          _showSnack('Charger connected — alarm silenced.', isAuto: true);
-        }
+      setState(() => _batteryState = state);
+      if ((state == BatteryState.charging || state == BatteryState.full) &&
+          _alarmTriggered) {
+        await _stopAlarmAuto();
       }
     });
-    Timer.periodic(const Duration(seconds: 20), (_) => _loadBattery());
+
+    // Syncs UI if service stopped in background (charger plugged while locked)
+    _watchdog = Timer.periodic(const Duration(seconds: 2), (_) => _sync());
 
     VolumeController.instance.showSystemUI = false;
     VolumeController.instance.addListener((vol) {
       if (mounted) setState(() => _volume = vol);
     }, fetchInitialVolume: true);
+  }
 
-    FlutterForegroundTask.isRunningService.then((running) {
-      if (mounted && running) {
-        setState(() {
-          _alarmTriggered = true;
-        });
+  @override
+  void dispose() {
+    _batterySub?.cancel();
+    _watchdog?.cancel();
+    _ringController.dispose();
+    _glowController.dispose();
+    VolumeController.instance.removeListener();
+    super.dispose();
+  }
 
-        _ringController.repeat();
-        _glowController.repeat(reverse: true);
+  Future<void> _sync() async {
+    if (!mounted) return;
+    final running = await FlutterForegroundTask.isRunningService;
+    if (!mounted) return;
+
+    if (_alarmTriggered && !running) {
+      setState(() {
+        _alarmTriggered = false;
+        _scheduledAlarm = null;
+      });
+      _ringController.stop();
+      _ringController.reset();
+      _glowController.stop();
+      _glowController.reset();
+      _showSnack('Charger connected — alarm silenced.', isAuto: true);
+    } else if (_alarmTriggered && running) {
+      final state = await _battery.batteryState;
+      if (!mounted) return;
+      if (state == BatteryState.charging || state == BatteryState.full) {
+        await _stopAlarmAuto();
       }
+    } else if (!_alarmTriggered && running) {
+      setState(() => _alarmTriggered = true);
+      _ringController.repeat();
+      _glowController.repeat(reverse: true);
+    }
+  }
+
+  Future<void> _stopAlarmAuto() async {
+    if (!_alarmTriggered) return;
+    setState(() {
+      _alarmTriggered = false;
+      _scheduledAlarm = null;
     });
+    _ringController.stop();
+    _ringController.reset();
+    _glowController.stop();
+    _glowController.reset();
+    await clearAlarm();
+    FlutterForegroundTask.sendDataToTask('STOP_ALARM');
+    await Future.delayed(const Duration(milliseconds: 400));
+    await FlutterForegroundTask.stopService();
+    _showSnack('Charger connected — alarm silenced.', isAuto: true);
+  }
+
+  Future<void> _stopAlarm() async {
+    if (!_alarmTriggered) return;
+    setState(() {
+      _alarmTriggered = false;
+      _scheduledAlarm = null;
+    });
+    _ringController.stop();
+    _ringController.reset();
+    _glowController.stop();
+    _glowController.reset();
+    HapticFeedback.mediumImpact();
+    await clearAlarm();
+    FlutterForegroundTask.sendDataToTask('STOP_ALARM');
+    await Future.delayed(const Duration(milliseconds: 400));
+    await FlutterForegroundTask.stopService();
+    _showSnack('Alarm stopped.', isAuto: false);
   }
 
   Future<void> _restoreAlarm() async {
     final saved = await loadAlarm();
-
-    if (!mounted || saved == null) return;
-
-    if (saved.isAfter(DateTime.now())) {
-      setState(() {
-        _scheduledAlarm = saved;
-      });
-    } else {
+    if (!mounted) return;
+    if (saved != null && saved.isAfter(DateTime.now())) {
+      setState(() => _scheduledAlarm = saved);
+    } else if (saved != null) {
       await clearAlarm();
     }
-
     final running = await FlutterForegroundTask.isRunningService;
-
-    if (running && mounted) {
-      setState(() {
-        _alarmTriggered = true;
-      });
-
+    if (!mounted) return;
+    if (running) {
+      setState(() => _alarmTriggered = true);
       _ringController.repeat();
-
       _glowController.repeat(reverse: true);
     }
   }
@@ -317,37 +397,31 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
       initialDate: now,
       firstDate: now,
       lastDate: DateTime(now.year + 5),
-      builder: (_, child) {
-        return Theme(
-          data: Theme.of(context).copyWith(
-            colorScheme: const ColorScheme.dark(
-              primary: _orange,
-              surface: _surface,
-            ),
+      builder: (_, child) => Theme(
+        data: Theme.of(context).copyWith(
+          colorScheme: const ColorScheme.dark(
+            primary: _orange,
+            surface: _surface,
           ),
-          child: child!,
-        );
-      },
+        ),
+        child: child!,
+      ),
     );
-
     if (pickedDate == null || !mounted) return;
 
     final pickedTime = await showTimePicker(
       context: context,
       initialTime: TimeOfDay.now(),
-      builder: (_, child) {
-        return Theme(
-          data: Theme.of(context).copyWith(
-            colorScheme: const ColorScheme.dark(
-              primary: _orange,
-              surface: _surface,
-            ),
+      builder: (_, child) => Theme(
+        data: Theme.of(context).copyWith(
+          colorScheme: const ColorScheme.dark(
+            primary: _orange,
+            surface: _surface,
           ),
-          child: child!,
-        );
-      },
+        ),
+        child: child!,
+      ),
     );
-
     if (pickedTime == null || !mounted) return;
 
     final alarmTime = DateTime(
@@ -363,21 +437,12 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
       return;
     }
 
-    setState(() {
-      _scheduledAlarm = alarmTime;
-    });
-
+    setState(() => _scheduledAlarm = alarmTime);
     await saveAlarm(alarmTime);
 
-    final canSchedule = await AndroidAlarmManager.periodic(
-      const Duration(hours: 1),
-      9999,
-      () {},
-    );
-
+    // Request both permissions needed for reliable background wakeup
     await Permission.scheduleExactAlarm.request();
-
-    dev.log('Alarm permission test: $canSchedule');
+    await Permission.ignoreBatteryOptimizations.request(); // ← ADD THIS
 
     await AndroidAlarmManager.oneShotAt(
       alarmTime,
@@ -387,32 +452,7 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
       wakeup: true,
       allowWhileIdle: true,
     );
-
-    _showSnack(
-      'Alarm scheduled for ${pickedTime.format(context)}',
-      isAuto: false,
-    );
-  }
-
-  Future<void> _stopAlarm({bool auto = false}) async {
-    if (!_alarmTriggered) return;
-    setState(() {
-      _alarmTriggered = false;
-      _scheduledAlarm = null;
-    });
-    _ringController.stop();
-    _ringController.reset();
-    _glowController.stop();
-    _glowController.reset();
-    HapticFeedback.mediumImpact();
-
-    await clearAlarm();
-    await FlutterForegroundTask.stopService();
-
-    _showSnack(
-      auto ? 'Charger detected — alarm silenced.' : 'Alarm stopped.',
-      isAuto: auto,
-    );
+    _showSnack('Alarm set for ${pickedTime.format(context)}', isAuto: false);
   }
 
   void _onVolumeChange(double v) {
@@ -453,15 +493,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
         duration: const Duration(seconds: 3),
       ),
     );
-  }
-
-  @override
-  void dispose() {
-    _batterySub?.cancel();
-    _ringController.dispose();
-    _glowController.dispose();
-    VolumeController.instance.removeListener();
-    super.dispose();
   }
 
   @override
@@ -574,6 +605,7 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
                       ),
                       const SizedBox(height: 28),
                     ],
+
                     SizedBox(
                       width: double.infinity,
                       height: 58,
@@ -594,13 +626,14 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
                         ),
                       ),
                     ),
+
                     if (_alarmTriggered) ...[
                       const SizedBox(height: 18),
                       SizedBox(
                         width: double.infinity,
                         height: 58,
                         child: OutlinedButton.icon(
-                          onPressed: () => _stopAlarm(),
+                          onPressed: _stopAlarm,
                           icon: const Icon(Icons.stop_rounded),
                           label: const Text('Stop Alarm'),
                           style: OutlinedButton.styleFrom(
@@ -703,7 +736,9 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
                       ),
                     ],
                   ),
+
                   const SizedBox(height: 16),
+
                   Row(
                     children: [
                       _Stat(
@@ -749,6 +784,7 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
 class _BatteryChip extends StatelessWidget {
   final int level;
   final BatteryState state;
+
   const _BatteryChip({required this.level, required this.state});
 
   @override
@@ -760,6 +796,7 @@ class _BatteryChip extends StatelessWidget {
         : charging
         ? Colors.greenAccent
         : Colors.white38;
+
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
@@ -792,8 +829,10 @@ class _BatteryChip extends StatelessWidget {
 }
 
 class _Stat extends StatelessWidget {
-  final String label, value;
+  final String label;
+  final String value;
   final Color accent;
+
   const _Stat({required this.label, required this.value, required this.accent});
 
   @override
