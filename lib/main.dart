@@ -7,7 +7,9 @@ import 'package:battery_plus/battery_plus.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:volume_controller/volume_controller.dart';
+import 'package:android_alarm_manager_plus/android_alarm_manager_plus.dart';
 
 const String kPortName = 'blare_port';
 
@@ -79,6 +81,36 @@ Future<String> copyAlarmToFile() async {
   return file.path;
 }
 
+@pragma('vm:entry-point')
+Future<void> alarmCallback() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  FlutterForegroundTask.init(
+    androidNotificationOptions: AndroidNotificationOptions(
+      channelId: 'blare_alarm',
+      channelName: 'Blare Alarm',
+      channelDescription: 'Keeps alarm alive in background',
+      onlyAlertOnce: true,
+      playSound: false,
+    ),
+    iosNotificationOptions: const IOSNotificationOptions(
+      showNotification: true,
+      playSound: false,
+    ),
+    foregroundTaskOptions: ForegroundTaskOptions(
+      eventAction: ForegroundTaskEventAction.nothing(),
+      autoRunOnBoot: false,
+    ),
+  );
+
+  await FlutterForegroundTask.startService(
+    serviceId: 1001,
+    notificationTitle: '🔔 Blare Alarm Ringing',
+    notificationText: 'Plug in charger to silence.',
+    callback: startCallback,
+  );
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
@@ -103,6 +135,8 @@ void main() async {
       autoRunOnBoot: false,
     ),
   );
+
+  await AndroidAlarmManager.initialize();
 
   runApp(const BlareApp());
 }
@@ -134,7 +168,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
   StreamSubscription<BatteryState>? _batterySub;
 
   DateTime? _scheduledAlarm;
-  Timer? _alarmTimer;
   bool _alarmTriggered = false;
   double _volume = 0.8;
   int _batteryLevel = 0;
@@ -142,7 +175,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
 
   late AnimationController _ringController;
   late AnimationController _glowController;
-  late Animation<double> _glowAnim;
 
   static const _orange = Color(0xFFFF6B00);
   static const _orangeDim = Color(0xFFFF6B0033);
@@ -161,9 +193,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
     _glowController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1200),
-    );
-    _glowAnim = Tween<double>(begin: 0.4, end: 1.0).animate(
-      CurvedAnimation(parent: _glowController, curve: Curves.easeInOut),
     );
 
     _loadBattery();
@@ -244,48 +273,29 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
       _scheduledAlarm = alarmTime;
     });
 
-    _alarmTimer?.cancel();
+    final canSchedule = await AndroidAlarmManager.periodic(
+      const Duration(hours: 1),
+      9999,
+      () {},
+    );
 
-    final duration = alarmTime.difference(DateTime.now());
+    await Permission.scheduleExactAlarm.request();
 
-    _alarmTimer = Timer(duration, () async {
-      _triggerAlarm();
-    });
+    dev.log('Alarm permission test: $canSchedule');
+
+    await AndroidAlarmManager.oneShotAt(
+      alarmTime,
+      2001,
+      alarmCallback,
+      exact: true,
+      wakeup: true,
+      allowWhileIdle: true,
+    );
 
     _showSnack(
       'Alarm scheduled for ${pickedTime.format(context)}',
       isAuto: false,
     );
-  }
-
-  Future<void> _triggerAlarm() async {
-    setState(() {
-      _alarmTriggered = true;
-    });
-
-    _ringController.repeat();
-    _glowController.repeat(reverse: true);
-
-    HapticFeedback.heavyImpact();
-
-    await FlutterForegroundTask.requestIgnoreBatteryOptimization();
-
-    await FlutterForegroundTask.startService(
-      serviceId: 1001,
-      notificationTitle: '🔔 Blare Alarm Ringing',
-      notificationText: 'Plug in charger to silence.',
-      callback: startCallback,
-    );
-
-    _batterySub = _battery.onBatteryStateChanged.listen((state) {
-      if (mounted) {
-        setState(() => _batteryState = state);
-      }
-
-      if (state == BatteryState.charging || state == BatteryState.full) {
-        _stopAlarm(auto: true);
-      }
-    });
   }
 
   Future<void> _stopAlarm({bool auto = false}) async {
@@ -639,37 +649,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
     color: Colors.white.withOpacity(0.07),
     margin: const EdgeInsets.symmetric(horizontal: 4),
   );
-}
-
-class _DashedRingPainter extends CustomPainter {
-  final Color color;
-  const _DashedRingPainter({required this.color});
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = color.withOpacity(0.5)
-      ..strokeWidth = 1.5
-      ..style = PaintingStyle.stroke;
-    final center = Offset(size.width / 2, size.height / 2);
-    const dashCount = 24;
-    const dashAngle = 0.18;
-    const gap = (3.14159 * 2 / dashCount) - dashAngle;
-    double angle = 0;
-    for (int i = 0; i < dashCount; i++) {
-      canvas.drawArc(
-        Rect.fromCircle(center: center, radius: size.width / 2),
-        angle,
-        dashAngle,
-        false,
-        paint,
-      );
-      angle += dashAngle + gap;
-    }
-  }
-
-  @override
-  bool shouldRepaint(_DashedRingPainter old) => old.color != color;
 }
 
 class _BatteryChip extends StatelessWidget {

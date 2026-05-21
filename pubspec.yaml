@@ -14,6 +14,8 @@ dependencies:
   volume_controller: ^3.5.0
   flutter_foreground_task: ^9.2.2
   path_provider: ^2.1.5
+  android_alarm_manager_plus: ^5.0.0
+  permission_handler: ^12.0.1
 
 dev_dependencies:
   flutter_test:
