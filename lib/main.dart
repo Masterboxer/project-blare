@@ -161,6 +161,8 @@ void main() async {
 
   await AndroidAlarmManager.initialize();
 
+  FlutterForegroundTask.initCommunicationPort();
+
   runApp(const BlareApp());
 }
 
@@ -227,6 +229,29 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
       setState(() {
         _batteryState = state;
       });
+
+      if (state == BatteryState.charging || state == BatteryState.full) {
+        final running = await FlutterForegroundTask.isRunningService;
+
+        if (running) {
+          FlutterForegroundTask.sendDataToTask('STOP_ALARM');
+
+          setState(() {
+            _alarmTriggered = false;
+            _scheduledAlarm = null;
+          });
+
+          _ringController.stop();
+          _ringController.reset();
+
+          _glowController.stop();
+          _glowController.reset();
+
+          await clearAlarm();
+
+          _showSnack('Charger connected — alarm silenced.', isAuto: true);
+        }
+      }
     });
     Timer.periodic(const Duration(seconds: 20), (_) => _loadBattery());
 
