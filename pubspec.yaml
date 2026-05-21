@@ -9,8 +9,9 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  audioplayers: ^5.2.1
-  battery_plus: ^6.0.2
+  audioplayers: ^6.6.0
+  battery_plus: ^7.0.0
+  flutter_foreground_task: ^9.2.2
 
 dev_dependencies:
   flutter_test:
