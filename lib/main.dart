@@ -1,86 +1,45 @@
 import 'dart:async';
-import 'dart:isolate';
-import 'dart:ui';
+import 'dart:developer' as dev;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:battery_plus/battery_plus.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:volume_controller/volume_controller.dart';
 
-const String kPortName = 'alarm_isolate_port';
+// ── Foreground service: just keeps the process alive, does NOT play audio ────
+// Audio lives in the main isolate where AssetSource works reliably.
+
+const String kPortName = 'blare_port';
 
 @pragma('vm:entry-point')
 void startCallback() {
-  FlutterForegroundTask.setTaskHandler(AlarmTaskHandler());
+  FlutterForegroundTask.setTaskHandler(_KeepAliveHandler());
 }
 
-class AlarmTaskHandler extends TaskHandler {
-  AudioPlayer? _player;
-  StreamSubscription<BatteryState>? _batterySub;
-  final Battery _battery = Battery();
-  SendPort? _sendPort;
-
+class _KeepAliveHandler extends TaskHandler {
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
-    _sendPort = IsolateNameServer.lookupPortByName(kPortName);
-
-    final data = await FlutterForegroundTask.getData<double>(key: 'volume');
-    final volume = data ?? 0.8;
-
-    _player = AudioPlayer();
-    await _player!.setReleaseMode(ReleaseMode.loop);
-    await _player!.setVolume(volume);
-    await _player!.play(AssetSource('alarm.mp3'));
-
-    _batterySub = _battery.onBatteryStateChanged.listen((state) {
-      if (state == BatteryState.charging || state == BatteryState.full) {
-        _sendPort?.send('stop');
-        _stopAndExit();
-      }
-    });
+    dev.log('KeepAlive service started', name: 'BLARE');
   }
 
   @override
-  void onRepeatEvent(DateTime timestamp) async {
-    final vol = await FlutterForegroundTask.getData<double>(key: 'volume');
-    if (vol != null && _player != null) {
-      await _player!.setVolume(vol);
-    }
-    final cmd = await FlutterForegroundTask.getData<String>(key: 'cmd');
-    if (cmd == 'stop') {
-      await FlutterForegroundTask.saveData(key: 'cmd', value: '');
-      _stopAndExit();
-    }
-  }
-
-  Future<void> _stopAndExit() async {
-    await _player?.stop();
-    await _player?.dispose();
-    _player = null;
-    await _batterySub?.cancel();
-    await FlutterForegroundTask.stopService();
-  }
+  void onRepeatEvent(DateTime timestamp) {}
 
   @override
   Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
-    await _player?.stop();
-    await _player?.dispose();
-    await _batterySub?.cancel();
+    dev.log('KeepAlive service destroyed', name: 'BLARE');
   }
 }
 
+// ── App ───────────────────────────────────────────────────────────────────────
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  _initForegroundTask();
-  runApp(const BlareApp());
-}
-
-void _initForegroundTask() {
   FlutterForegroundTask.init(
     androidNotificationOptions: AndroidNotificationOptions(
       channelId: 'blare_alarm',
       channelName: 'Blare Alarm',
-      channelDescription: 'Alarm sounds until charger is connected',
+      channelDescription: 'Keeps alarm alive in background',
       onlyAlertOnce: true,
       playSound: false,
     ),
@@ -89,16 +48,15 @@ void _initForegroundTask() {
       playSound: false,
     ),
     foregroundTaskOptions: ForegroundTaskOptions(
-      eventAction: ForegroundTaskEventAction.repeat(300),
+      eventAction: ForegroundTaskEventAction.nothing(),
       autoRunOnBoot: false,
-      allowWifiLock: false,
     ),
   );
+  runApp(const BlareApp());
 }
 
 class BlareApp extends StatelessWidget {
   const BlareApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -106,7 +64,6 @@ class BlareApp extends StatelessWidget {
       title: 'Blare',
       theme: ThemeData(
         useMaterial3: true,
-        fontFamily: 'monospace',
         scaffoldBackgroundColor: const Color(0xFF0E0A00),
       ),
       home: const AlarmPage(),
@@ -114,17 +71,18 @@ class BlareApp extends StatelessWidget {
   }
 }
 
+// ── Main Page ─────────────────────────────────────────────────────────────────
 class AlarmPage extends StatefulWidget {
   const AlarmPage({super.key});
-
   @override
   State<AlarmPage> createState() => _AlarmPageState();
 }
 
 class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
+  // Audio lives here in the main isolate — same as the original that worked
+  final AudioPlayer _player = AudioPlayer();
   final Battery _battery = Battery();
   StreamSubscription<BatteryState>? _batterySub;
-  ReceivePort? _receivePort;
 
   bool _isRunning = false;
   double _volume = 0.8;
@@ -159,6 +117,12 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
 
     _loadBattery();
     Timer.periodic(const Duration(seconds: 20), (_) => _loadBattery());
+
+    // Sync slider to current system media volume
+    VolumeController.instance.showSystemUI = false;
+    VolumeController.instance.addListener((vol) {
+      if (mounted) setState(() => _volume = vol);
+    }, fetchInitialVolume: true);
   }
 
   Future<void> _loadBattery() async {
@@ -171,26 +135,14 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
       });
   }
 
+  // ── ARM ───────────────────────────────────────────────────────────────────
   Future<void> _start() async {
     setState(() => _isRunning = true);
     _ringController.repeat();
     _glowController.repeat(reverse: true);
     HapticFeedback.heavyImpact();
 
-    _receivePort = ReceivePort();
-    IsolateNameServer.removePortNameMapping(kPortName);
-    IsolateNameServer.registerPortWithName(_receivePort!.sendPort, kPortName);
-    _receivePort!.listen((msg) {
-      if (msg == 'stop' && mounted) _onAutoStop();
-    });
-
-    await FlutterForegroundTask.saveData(key: 'volume', value: _volume);
-    await FlutterForegroundTask.saveData(key: 'cmd', value: '');
-
-    _batterySub = _battery.onBatteryStateChanged.listen((state) {
-      if (mounted) setState(() => _batteryState = state);
-    });
-
+    // 1. Start foreground service — keeps process alive when app is closed
     await FlutterForegroundTask.requestIgnoreBatteryOptimization();
     await FlutterForegroundTask.startService(
       serviceId: 1001,
@@ -198,9 +150,36 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
       notificationText: 'Plug in charger to silence the alarm.',
       callback: startCallback,
     );
+
+    // 2. Play audio in main isolate (AssetSource works here, always has)
+    await _player.setAudioContext(
+      AudioContext(
+        android: AudioContextAndroid(
+          audioFocus: AndroidAudioFocus.gain,
+          stayAwake: true,
+          contentType: AndroidContentType.music,
+          usageType: AndroidUsageType.alarm,
+          isSpeakerphoneOn: false,
+        ),
+      ),
+    );
+    await _player.setReleaseMode(ReleaseMode.loop);
+    await _player.setVolume(1.0);
+    await _player.play(AssetSource('alarm.mp3'));
+    dev.log('Audio playing via AssetSource', name: 'BLARE');
+
+    // 3. Watch battery state
+    _batterySub = _battery.onBatteryStateChanged.listen((state) {
+      if (mounted) setState(() => _batteryState = state);
+      if (state == BatteryState.charging || state == BatteryState.full) {
+        _stopAlarm(auto: true);
+      }
+    });
   }
 
-  Future<void> _stop() async {
+  // ── DISARM ────────────────────────────────────────────────────────────────
+  Future<void> _stopAlarm({bool auto = false}) async {
+    if (!_isRunning) return;
     setState(() => _isRunning = false);
     _ringController.stop();
     _ringController.reset();
@@ -208,36 +187,21 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
     _glowController.reset();
     HapticFeedback.mediumImpact();
 
+    await _player.stop();
     await _batterySub?.cancel();
     _batterySub = null;
-    _receivePort?.close();
-    IsolateNameServer.removePortNameMapping(kPortName);
-
-    await FlutterForegroundTask.saveData(key: 'cmd', value: 'stop');
-    await Future.delayed(const Duration(milliseconds: 400));
     await FlutterForegroundTask.stopService();
 
-    _showSnack('Alarm stopped.', isAuto: false);
+    _showSnack(
+      auto ? 'Charger detected — alarm silenced.' : 'Alarm stopped.',
+      isAuto: auto,
+    );
   }
 
-  void _onAutoStop() {
-    setState(() => _isRunning = false);
-    _ringController.stop();
-    _ringController.reset();
-    _glowController.stop();
-    _glowController.reset();
-    HapticFeedback.heavyImpact();
-    _batterySub?.cancel();
-    _batterySub = null;
-    _receivePort?.close();
-    IsolateNameServer.removePortNameMapping(kPortName);
-    _loadBattery();
-    _showSnack('Charger detected — alarm silenced.', isAuto: true);
-  }
-
+  // ── VOLUME ────────────────────────────────────────────────────────────────
   void _onVolumeChange(double v) {
     setState(() => _volume = v);
-    FlutterForegroundTask.saveData(key: 'volume', value: v);
+    VolumeController.instance.setVolume(v);
   }
 
   void _showSnack(String msg, {required bool isAuto}) {
@@ -277,295 +241,293 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
 
   @override
   void dispose() {
+    _player.dispose();
+    _batterySub?.cancel();
     _ringController.dispose();
     _glowController.dispose();
-    _batterySub?.cancel();
-    _receivePort?.close();
+    VolumeController.instance.removeListener();
     super.dispose();
   }
 
+  // ── BUILD ─────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     final isCharging =
         _batteryState == BatteryState.charging ||
         _batteryState == BatteryState.full;
 
-    return WithForegroundTask(
-      child: Scaffold(
-        backgroundColor: _bg,
-        body: SafeArea(
-          child: Column(
-            children: [
-              Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 24,
-                  vertical: 20,
-                ),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  children: [
-                    Container(
-                      width: 36,
-                      height: 36,
-                      decoration: BoxDecoration(
-                        color: _orange,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: const Icon(
-                        Icons.alarm_rounded,
-                        color: Colors.black,
-                        size: 20,
-                      ),
+    return Scaffold(
+      backgroundColor: _bg,
+      body: SafeArea(
+        child: Column(
+          children: [
+            // Top bar
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+              child: Row(
+                children: [
+                  Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: _orange,
+                      borderRadius: BorderRadius.circular(8),
                     ),
-                    const SizedBox(width: 12),
-                    const Text(
-                      'BLARE',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 18,
-                        fontWeight: FontWeight.w900,
-                        letterSpacing: 6,
-                        fontFamily: 'monospace',
-                      ),
-                    ),
-                    const Spacer(),
-                    _BatteryChip(level: _batteryLevel, state: _batteryState),
-                  ],
-                ),
-              ),
-
-              const SizedBox(height: 12),
-
-              Expanded(
-                child: Center(
-                  child: GestureDetector(
-                    onTap: _isRunning ? _stop : _start,
-                    child: Stack(
-                      alignment: Alignment.center,
-                      children: [
-                        if (_isRunning) ...[
-                          AnimatedBuilder(
-                            animation: _glowAnim,
-                            builder: (_, __) => Container(
-                              width: 280,
-                              height: 280,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: _orange.withOpacity(
-                                      0.15 * _glowAnim.value,
-                                    ),
-                                    blurRadius: 60,
-                                    spreadRadius: 20,
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                          RotationTransition(
-                            turns: _ringController,
-                            child: CustomPaint(
-                              size: const Size(240, 240),
-                              painter: _DashedRingPainter(color: _orange),
-                            ),
-                          ),
-                        ],
-
-                        Container(
-                          width: 220,
-                          height: 220,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: _isRunning
-                                  ? _orange.withOpacity(0.6)
-                                  : Colors.white.withOpacity(0.06),
-                              width: 1.5,
-                            ),
-                          ),
-                        ),
-
-                        AnimatedBuilder(
-                          animation: _glowAnim,
-                          builder: (_, child) => Container(
-                            width: 180,
-                            height: 180,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: _isRunning ? _orange : _surface,
-                              boxShadow: _isRunning
-                                  ? [
-                                      BoxShadow(
-                                        color: _orange.withOpacity(
-                                          0.5 * _glowAnim.value,
-                                        ),
-                                        blurRadius: 40,
-                                        spreadRadius: 4,
-                                      ),
-                                    ]
-                                  : [
-                                      BoxShadow(
-                                        color: Colors.black.withOpacity(0.4),
-                                        blurRadius: 24,
-                                        offset: const Offset(0, 8),
-                                      ),
-                                    ],
-                            ),
-                            child: child,
-                          ),
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Icon(
-                                _isRunning
-                                    ? Icons.stop_rounded
-                                    : Icons.alarm_rounded,
-                                size: 48,
-                                color: _isRunning
-                                    ? Colors.black
-                                    : Colors.white.withOpacity(0.85),
-                              ),
-                              const SizedBox(height: 6),
-                              Text(
-                                _isRunning ? 'STOP' : 'ARM',
-                                style: TextStyle(
-                                  color: _isRunning
-                                      ? Colors.black
-                                      : Colors.white.withOpacity(0.85),
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w900,
-                                  letterSpacing: 4,
-                                  fontFamily: 'monospace',
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
+                    child: const Icon(
+                      Icons.alarm_rounded,
+                      color: Colors.black,
+                      size: 20,
                     ),
                   ),
-                ),
-              ),
-
-              Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 250),
-                  child: Text(
-                    _isRunning
-                        ? 'WAITING FOR CHARGER...'
-                        : isCharging
-                        ? 'CHARGER CONNECTED'
-                        : 'CONNECT CHARGER TO TRIGGER',
-                    key: ValueKey(_isRunning),
+                  const SizedBox(width: 12),
+                  const Text(
+                    'BLARE',
                     style: TextStyle(
-                      color: _isRunning
-                          ? _orange.withOpacity(0.8)
-                          : isCharging
-                          ? Colors.greenAccent.withOpacity(0.7)
-                          : Colors.white24,
-                      fontSize: 10,
-                      fontWeight: FontWeight.w700,
-                      letterSpacing: 3,
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 6,
                       fontFamily: 'monospace',
                     ),
                   ),
-                ),
+                  const Spacer(),
+                  _BatteryChip(level: _batteryLevel, state: _batteryState),
+                ],
               ),
+            ),
 
-              Container(
-                margin: const EdgeInsets.fromLTRB(16, 0, 16, 20),
-                padding: const EdgeInsets.fromLTRB(20, 20, 20, 20),
-                decoration: BoxDecoration(
-                  color: _surface,
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(color: Colors.white.withOpacity(0.05)),
-                ),
-                child: Column(
-                  children: [
-                    Row(
-                      children: [
-                        Icon(
-                          _volume == 0
-                              ? Icons.volume_off_rounded
-                              : Icons.volume_up_rounded,
-                          color: _orange.withOpacity(0.8),
-                          size: 18,
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: SliderTheme(
-                            data: SliderTheme.of(context).copyWith(
-                              trackHeight: 2,
-                              activeTrackColor: _orange,
-                              inactiveTrackColor: Colors.white10,
-                              thumbColor: Colors.white,
-                              overlayColor: _orangeDim,
-                              thumbShape: const RoundSliderThumbShape(
-                                enabledThumbRadius: 7,
-                              ),
-                              overlayShape: const RoundSliderOverlayShape(
-                                overlayRadius: 14,
-                              ),
-                            ),
-                            child: Slider(
-                              value: _volume,
-                              min: 0,
-                              max: 1,
-                              onChanged: _onVolumeChange,
+            const SizedBox(height: 12),
+
+            // Central button
+            Expanded(
+              child: Center(
+                child: GestureDetector(
+                  onTap: _isRunning ? () => _stopAlarm() : _start,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      if (_isRunning) ...[
+                        AnimatedBuilder(
+                          animation: _glowAnim,
+                          builder: (_, __) => Container(
+                            width: 280,
+                            height: 280,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: _orange.withOpacity(
+                                    0.15 * _glowAnim.value,
+                                  ),
+                                  blurRadius: 60,
+                                  spreadRadius: 20,
+                                ),
+                              ],
                             ),
                           ),
                         ),
-                        const SizedBox(width: 8),
-                        SizedBox(
-                          width: 34,
-                          child: Text(
-                            '${(_volume * 100).round()}',
-                            textAlign: TextAlign.right,
-                            style: const TextStyle(
-                              color: Colors.white38,
-                              fontSize: 12,
-                              fontFamily: 'monospace',
-                              fontWeight: FontWeight.w700,
-                            ),
+                        RotationTransition(
+                          turns: _ringController,
+                          child: CustomPaint(
+                            size: const Size(240, 240),
+                            painter: _DashedRingPainter(color: _orange),
                           ),
                         ),
                       ],
-                    ),
-
-                    const SizedBox(height: 16),
-
-                    Row(
-                      children: [
-                        _Stat(
-                          label: 'BATTERY',
-                          value: '$_batteryLevel%',
-                          accent: _batteryLevel < 20
-                              ? Colors.redAccent
-                              : Colors.white70,
+                      Container(
+                        width: 220,
+                        height: 220,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: _isRunning
+                                ? _orange.withOpacity(0.6)
+                                : Colors.white.withOpacity(0.06),
+                            width: 1.5,
+                          ),
                         ),
-                        _divider(),
-                        _Stat(
-                          label: 'POWER',
-                          value: isCharging ? 'IN' : 'OUT',
-                          accent: isCharging
-                              ? Colors.greenAccent
-                              : Colors.white38,
+                      ),
+                      AnimatedBuilder(
+                        animation: _glowAnim,
+                        builder: (_, child) => Container(
+                          width: 180,
+                          height: 180,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: _isRunning ? _orange : _surface,
+                            boxShadow: _isRunning
+                                ? [
+                                    BoxShadow(
+                                      color: _orange.withOpacity(
+                                        0.5 * _glowAnim.value,
+                                      ),
+                                      blurRadius: 40,
+                                      spreadRadius: 4,
+                                    ),
+                                  ]
+                                : [
+                                    BoxShadow(
+                                      color: Colors.black.withOpacity(0.4),
+                                      blurRadius: 24,
+                                      offset: const Offset(0, 8),
+                                    ),
+                                  ],
+                          ),
+                          child: child,
                         ),
-                        _divider(),
-                        _Stat(
-                          label: 'ALARM',
-                          value: _isRunning ? 'LIVE' : 'OFF',
-                          accent: _isRunning ? _orange : Colors.white38,
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              _isRunning
+                                  ? Icons.stop_rounded
+                                  : Icons.alarm_rounded,
+                              size: 48,
+                              color: _isRunning
+                                  ? Colors.black
+                                  : Colors.white.withOpacity(0.85),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              _isRunning ? 'STOP' : 'ARM',
+                              style: TextStyle(
+                                color: _isRunning
+                                    ? Colors.black
+                                    : Colors.white.withOpacity(0.85),
+                                fontSize: 11,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: 4,
+                                fontFamily: 'monospace',
+                              ),
+                            ),
+                          ],
                         ),
-                      ],
-                    ),
-                  ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
-            ],
-          ),
+            ),
+
+            // Status
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 250),
+                child: Text(
+                  _isRunning
+                      ? 'WAITING FOR CHARGER...'
+                      : isCharging
+                      ? 'CHARGER CONNECTED'
+                      : 'CONNECT CHARGER TO TRIGGER',
+                  key: ValueKey(_isRunning),
+                  style: TextStyle(
+                    color: _isRunning
+                        ? _orange.withOpacity(0.8)
+                        : isCharging
+                        ? Colors.greenAccent.withOpacity(0.7)
+                        : Colors.white24,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 3,
+                    fontFamily: 'monospace',
+                  ),
+                ),
+              ),
+            ),
+
+            // Bottom panel
+            Container(
+              margin: const EdgeInsets.fromLTRB(16, 0, 16, 20),
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: _surface,
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: Colors.white.withOpacity(0.05)),
+              ),
+              child: Column(
+                children: [
+                  // Volume slider
+                  Row(
+                    children: [
+                      Icon(
+                        _volume == 0
+                            ? Icons.volume_off_rounded
+                            : Icons.volume_up_rounded,
+                        color: _orange.withOpacity(0.8),
+                        size: 18,
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: SliderTheme(
+                          data: SliderTheme.of(context).copyWith(
+                            trackHeight: 2,
+                            activeTrackColor: _orange,
+                            inactiveTrackColor: Colors.white10,
+                            thumbColor: Colors.white,
+                            overlayColor: _orangeDim,
+                            thumbShape: const RoundSliderThumbShape(
+                              enabledThumbRadius: 7,
+                            ),
+                            overlayShape: const RoundSliderOverlayShape(
+                              overlayRadius: 14,
+                            ),
+                          ),
+                          child: Slider(
+                            value: _volume,
+                            min: 0,
+                            max: 1,
+                            onChanged: _onVolumeChange,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      SizedBox(
+                        width: 34,
+                        child: Text(
+                          '${(_volume * 100).round()}',
+                          textAlign: TextAlign.right,
+                          style: const TextStyle(
+                            color: Colors.white38,
+                            fontSize: 12,
+                            fontFamily: 'monospace',
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  // Stats
+                  Row(
+                    children: [
+                      _Stat(
+                        label: 'BATTERY',
+                        value: '$_batteryLevel%',
+                        accent: _batteryLevel < 20
+                            ? Colors.redAccent
+                            : Colors.white70,
+                      ),
+                      _divider(),
+                      _Stat(
+                        label: 'POWER',
+                        value: isCharging ? 'IN' : 'OUT',
+                        accent: isCharging
+                            ? Colors.greenAccent
+                            : Colors.white38,
+                      ),
+                      _divider(),
+                      _Stat(
+                        label: 'ALARM',
+                        value: _isRunning ? 'LIVE' : 'OFF',
+                        accent: _isRunning ? _orange : Colors.white38,
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -579,6 +541,7 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
   );
 }
 
+// ── Painters & sub-widgets ────────────────────────────────────────────────────
 class _DashedRingPainter extends CustomPainter {
   final Color color;
   const _DashedRingPainter({required this.color});
@@ -589,23 +552,20 @@ class _DashedRingPainter extends CustomPainter {
       ..color = color.withOpacity(0.5)
       ..strokeWidth = 1.5
       ..style = PaintingStyle.stroke;
-
     final center = Offset(size.width / 2, size.height / 2);
-    final radius = size.width / 2;
     const dashCount = 24;
     const dashAngle = 0.18;
-    const gapAngle = (3.14159 * 2 / dashCount) - dashAngle;
-
+    const gap = (3.14159 * 2 / dashCount) - dashAngle;
     double angle = 0;
     for (int i = 0; i < dashCount; i++) {
       canvas.drawArc(
-        Rect.fromCircle(center: center, radius: radius),
+        Rect.fromCircle(center: center, radius: size.width / 2),
         angle,
         dashAngle,
         false,
         paint,
       );
-      angle += dashAngle + gapAngle;
+      angle += dashAngle + gap;
     }
   }
 
@@ -620,14 +580,13 @@ class _BatteryChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isCharging =
+    final charging =
         state == BatteryState.charging || state == BatteryState.full;
     final col = level < 20
         ? Colors.redAccent
-        : isCharging
+        : charging
         ? Colors.greenAccent
         : Colors.white38;
-
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
@@ -639,7 +598,7 @@ class _BatteryChip extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           Icon(
-            isCharging ? Icons.bolt_rounded : Icons.battery_std_rounded,
+            charging ? Icons.bolt_rounded : Icons.battery_std_rounded,
             color: col,
             size: 13,
           ),
@@ -651,7 +610,6 @@ class _BatteryChip extends StatelessWidget {
               fontSize: 11,
               fontWeight: FontWeight.w800,
               fontFamily: 'monospace',
-              letterSpacing: 0.5,
             ),
           ),
         ],
@@ -661,8 +619,7 @@ class _BatteryChip extends StatelessWidget {
 }
 
 class _Stat extends StatelessWidget {
-  final String label;
-  final String value;
+  final String label, value;
   final Color accent;
   const _Stat({required this.label, required this.value, required this.accent});
 
