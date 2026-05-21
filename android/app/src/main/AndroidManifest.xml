@@ -36,9 +36,18 @@
             android:permission="android.permission.BIND_JOB_SERVICE"
             android:exported="false" />
 
+
         <receiver
-            android:name="dev.fluttercommunity.plus.androidalarmmanager.AlarmBroadcastReceiver"
+            android:name="com.pravera.flutter_foreground_task.receiver.ActionBroadcastReceiver"
             android:exported="false" />
+
+        <receiver
+            android:name=".PowerReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.ACTION_POWER_CONNECTED" />
+            </intent-filter>
+        </receiver>
 
         <receiver
             android:name="dev.fluttercommunity.plus.androidalarmmanager.RebootBroadcastReceiver"
@@ -60,6 +69,11 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+
+        <receiver
+            android:name="dev.fluttercommunity.plus.androidalarmmanager.AlarmBroadcastReceiver"
+            android:exported="false" />
 
         <meta-data
             android:name="flutterEmbedding"

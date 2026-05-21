@@ -1,4 +1,4 @@
-package com.example.project_blare
+package com.masterboxer.project_blare
 
 import io.flutter.embedding.android.FlutterActivity
 

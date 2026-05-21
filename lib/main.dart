@@ -37,8 +37,6 @@ class _KeepAliveHandler extends TaskHandler {
     await _player.setVolume(1.0);
 
     await _player.play();
-
-    dev.log('Alarm audio started from foreground service', name: 'BLARE');
   }
 
   @override
@@ -50,6 +48,17 @@ class _KeepAliveHandler extends TaskHandler {
     await _player.dispose();
 
     dev.log('Foreground service destroyed', name: 'BLARE');
+  }
+
+  @override
+  Future<void> onReceiveData(Object data) async {
+    if (data == 'STOP_ALARM') {
+      await clearAlarm();
+
+      await _player.stop();
+
+      await FlutterForegroundTask.stopService();
+    }
   }
 }
 
@@ -218,22 +227,6 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
       setState(() {
         _batteryState = state;
       });
-
-      if (state == BatteryState.charging || state == BatteryState.full) {
-        final running = await FlutterForegroundTask.isRunningService;
-
-        if (running) {
-          dev.log('UI detected charger — stopping service', name: 'BLARE');
-
-          await FlutterForegroundTask.stopService();
-
-          setState(() {
-            _alarmTriggered = false;
-          });
-
-          _showSnack('Charger connected — alarm silenced.', isAuto: true);
-        }
-      }
     });
     Timer.periodic(const Duration(seconds: 20), (_) => _loadBattery());
 
@@ -388,8 +381,7 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
     _glowController.reset();
     HapticFeedback.mediumImpact();
 
-    await _batterySub?.cancel();
-    _batterySub = null;
+    await clearAlarm();
     await FlutterForegroundTask.stopService();
 
     _showSnack(
