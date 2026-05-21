@@ -133,7 +133,9 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
   final Battery _battery = Battery();
   StreamSubscription<BatteryState>? _batterySub;
 
-  bool _isRunning = false;
+  DateTime? _scheduledAlarm;
+  Timer? _alarmTimer;
+  bool _alarmTriggered = false;
   double _volume = 0.8;
   int _batteryLevel = 0;
   BatteryState _batteryState = BatteryState.unknown;
@@ -184,22 +186,102 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> _start() async {
-    setState(() => _isRunning = true);
+  Future<void> _scheduleAlarm() async {
+    final now = DateTime.now();
+
+    final pickedDate = await showDatePicker(
+      context: context,
+      initialDate: now,
+      firstDate: now,
+      lastDate: DateTime(now.year + 5),
+      builder: (_, child) {
+        return Theme(
+          data: Theme.of(context).copyWith(
+            colorScheme: const ColorScheme.dark(
+              primary: _orange,
+              surface: _surface,
+            ),
+          ),
+          child: child!,
+        );
+      },
+    );
+
+    if (pickedDate == null || !mounted) return;
+
+    final pickedTime = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.now(),
+      builder: (_, child) {
+        return Theme(
+          data: Theme.of(context).copyWith(
+            colorScheme: const ColorScheme.dark(
+              primary: _orange,
+              surface: _surface,
+            ),
+          ),
+          child: child!,
+        );
+      },
+    );
+
+    if (pickedTime == null || !mounted) return;
+
+    final alarmTime = DateTime(
+      pickedDate.year,
+      pickedDate.month,
+      pickedDate.day,
+      pickedTime.hour,
+      pickedTime.minute,
+    );
+
+    if (alarmTime.isBefore(DateTime.now())) {
+      _showSnack('Selected time is in the past.', isAuto: false);
+      return;
+    }
+
+    setState(() {
+      _scheduledAlarm = alarmTime;
+    });
+
+    _alarmTimer?.cancel();
+
+    final duration = alarmTime.difference(DateTime.now());
+
+    _alarmTimer = Timer(duration, () async {
+      _triggerAlarm();
+    });
+
+    _showSnack(
+      'Alarm scheduled for ${pickedTime.format(context)}',
+      isAuto: false,
+    );
+  }
+
+  Future<void> _triggerAlarm() async {
+    setState(() {
+      _alarmTriggered = true;
+    });
+
     _ringController.repeat();
     _glowController.repeat(reverse: true);
+
     HapticFeedback.heavyImpact();
 
     await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+
     await FlutterForegroundTask.startService(
       serviceId: 1001,
-      notificationTitle: '🔔 Blare is armed',
-      notificationText: 'Plug in charger to silence the alarm.',
+      notificationTitle: '🔔 Blare Alarm Ringing',
+      notificationText: 'Plug in charger to silence.',
       callback: startCallback,
     );
 
     _batterySub = _battery.onBatteryStateChanged.listen((state) {
-      if (mounted) setState(() => _batteryState = state);
+      if (mounted) {
+        setState(() => _batteryState = state);
+      }
+
       if (state == BatteryState.charging || state == BatteryState.full) {
         _stopAlarm(auto: true);
       }
@@ -207,8 +289,11 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
   }
 
   Future<void> _stopAlarm({bool auto = false}) async {
-    if (!_isRunning) return;
-    setState(() => _isRunning = false);
+    if (!_alarmTriggered) return;
+    setState(() {
+      _alarmTriggered = false;
+      _scheduledAlarm = null;
+    });
     _ringController.stop();
     _ringController.reset();
     _glowController.stop();
@@ -322,111 +407,108 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
             const SizedBox(height: 12),
 
             Expanded(
-              child: Center(
-                child: GestureDetector(
-                  onTap: _isRunning ? () => _stopAlarm() : _start,
-                  child: Stack(
-                    alignment: Alignment.center,
-                    children: [
-                      if (_isRunning) ...[
-                        AnimatedBuilder(
-                          animation: _glowAnim,
-                          builder: (_, __) => Container(
-                            width: 280,
-                            height: 280,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              boxShadow: [
-                                BoxShadow(
-                                  color: _orange.withOpacity(
-                                    0.15 * _glowAnim.value,
-                                  ),
-                                  blurRadius: 60,
-                                  spreadRadius: 20,
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        RotationTransition(
-                          turns: _ringController,
-                          child: CustomPaint(
-                            size: const Size(240, 240),
-                            painter: _DashedRingPainter(color: _orange),
-                          ),
-                        ),
-                      ],
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    if (_scheduledAlarm != null) ...[
                       Container(
-                        width: 220,
-                        height: 220,
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(24),
                         decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: _isRunning
-                                ? _orange.withOpacity(0.6)
-                                : Colors.white.withOpacity(0.06),
-                            width: 1.5,
-                          ),
-                        ),
-                      ),
-                      AnimatedBuilder(
-                        animation: _glowAnim,
-                        builder: (_, child) => Container(
-                          width: 180,
-                          height: 180,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: _isRunning ? _orange : _surface,
-                            boxShadow: _isRunning
-                                ? [
-                                    BoxShadow(
-                                      color: _orange.withOpacity(
-                                        0.5 * _glowAnim.value,
-                                      ),
-                                      blurRadius: 40,
-                                      spreadRadius: 4,
-                                    ),
-                                  ]
-                                : [
-                                    BoxShadow(
-                                      color: Colors.black.withOpacity(0.4),
-                                      blurRadius: 24,
-                                      offset: const Offset(0, 8),
-                                    ),
-                                  ],
-                          ),
-                          child: child,
+                          color: _surface,
+                          borderRadius: BorderRadius.circular(24),
+                          border: Border.all(color: _orange.withOpacity(0.25)),
                         ),
                         child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            Icon(
-                              _isRunning
-                                  ? Icons.stop_rounded
-                                  : Icons.alarm_rounded,
-                              size: 48,
-                              color: _isRunning
-                                  ? Colors.black
-                                  : Colors.white.withOpacity(0.85),
-                            ),
-                            const SizedBox(height: 6),
                             Text(
-                              _isRunning ? 'STOP' : 'ARM',
-                              style: TextStyle(
-                                color: _isRunning
-                                    ? Colors.black
-                                    : Colors.white.withOpacity(0.85),
-                                fontSize: 11,
+                              TimeOfDay.fromDateTime(
+                                _scheduledAlarm!,
+                              ).format(context),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 54,
                                 fontWeight: FontWeight.w900,
-                                letterSpacing: 4,
                                 fontFamily: 'monospace',
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              '${_scheduledAlarm!.day}/${_scheduledAlarm!.month}/${_scheduledAlarm!.year}',
+                              style: TextStyle(
+                                color: Colors.white.withOpacity(0.5),
+                                fontSize: 14,
+                                letterSpacing: 2,
+                                fontFamily: 'monospace',
+                              ),
+                            ),
+                            const SizedBox(height: 20),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 8,
+                              ),
+                              decoration: BoxDecoration(
+                                color: _orange.withOpacity(0.12),
+                                borderRadius: BorderRadius.circular(100),
+                              ),
+                              child: Text(
+                                _alarmTriggered ? 'RINGING' : 'SCHEDULED',
+                                style: const TextStyle(
+                                  color: _orange,
+                                  fontWeight: FontWeight.w800,
+                                  letterSpacing: 2,
+                                  fontSize: 11,
+                                ),
                               ),
                             ),
                           ],
                         ),
                       ),
+                      const SizedBox(height: 28),
                     ],
-                  ),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 58,
+                      child: ElevatedButton.icon(
+                        onPressed: _scheduleAlarm,
+                        icon: const Icon(Icons.add_alarm_rounded),
+                        label: const Text('Schedule Alarm'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: _orange,
+                          foregroundColor: Colors.black,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(18),
+                          ),
+                          textStyle: const TextStyle(
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 1,
+                          ),
+                        ),
+                      ),
+                    ),
+                    if (_alarmTriggered) ...[
+                      const SizedBox(height: 18),
+                      SizedBox(
+                        width: double.infinity,
+                        height: 58,
+                        child: OutlinedButton.icon(
+                          onPressed: () => _stopAlarm(),
+                          icon: const Icon(Icons.stop_rounded),
+                          label: const Text('Stop Alarm'),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: _orange,
+                            side: BorderSide(color: _orange.withOpacity(0.4)),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(18),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
               ),
             ),
@@ -436,14 +518,14 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
               child: AnimatedSwitcher(
                 duration: const Duration(milliseconds: 250),
                 child: Text(
-                  _isRunning
+                  _alarmTriggered
                       ? 'WAITING FOR CHARGER...'
                       : isCharging
                       ? 'CHARGER CONNECTED'
                       : 'CONNECT CHARGER TO TRIGGER',
-                  key: ValueKey(_isRunning),
+                  key: ValueKey(_alarmTriggered),
                   style: TextStyle(
-                    color: _isRunning
+                    color: _alarmTriggered
                         ? _orange.withOpacity(0.8)
                         : isCharging
                         ? Colors.greenAccent.withOpacity(0.7)
@@ -537,8 +619,8 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
                       _divider(),
                       _Stat(
                         label: 'ALARM',
-                        value: _isRunning ? 'LIVE' : 'OFF',
-                        accent: _isRunning ? _orange : Colors.white38,
+                        value: _alarmTriggered ? 'LIVE' : 'OFF',
+                        accent: _alarmTriggered ? _orange : Colors.white38,
                       ),
                     ],
                   ),
