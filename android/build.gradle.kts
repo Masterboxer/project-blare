@@ -1,3 +1,5 @@
+val defaultVersionCode by extra(1)
+
 allprojects {
     repositories {
         google()
