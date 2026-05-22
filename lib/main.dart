@@ -660,7 +660,7 @@ class _AlarmPageState extends State<AlarmPage> with TickerProviderStateMixin {
                       ? 'WAITING FOR CHARGER...'
                       : isCharging
                       ? 'CHARGER CONNECTED'
-                      : 'CONNECT CHARGER TO TRIGGER',
+                      : 'DEVICE NOT CHARGING',
                   key: ValueKey(_alarmTriggered),
                   style: TextStyle(
                     color: _alarmTriggered
